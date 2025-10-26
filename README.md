@@ -1,7 +1,10 @@
 # task.sh
 
 [![Crates.io](https://img.shields.io/crates/v/task-sh.svg)](https://crates.io/crates/task-sh)
+[![Downloads](https://img.shields.io/crates/d/task-sh.svg)](https://crates.io/crates/task-sh)
+[![Docs](https://docs.rs/task-sh/badge.svg)](https://docs.rs/task-sh)
 [![CI](https://github.com/barledge/task.sh/actions/workflows/rust.yml/badge.svg)](https://github.com/barledge/task.sh/actions)
+[![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
 `task.sh` turns natural language task descriptions into safe shell command suggestions using OpenAI. The CLI is designed for cross-platform usage (Linux, macOS) and emphasizes safety, observability, and customization.
 
