@@ -1,0 +1,8 @@
+[book]
+title = "task-sh Documentation"
+author = "task.sh Contributors"
+multilingual = false
+src = "src"
+
+[output.html]
+site-url = "https://task.sh/docs/"

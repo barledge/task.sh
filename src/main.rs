@@ -1,0 +1,459 @@
+mod config;
+mod generator;
+
+use std::io::{self, Read, Write};
+use std::process::Command;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
+use std::thread;
+use std::time::{Duration, Instant};
+
+use anyhow::{Context, Result};
+use clap::{ArgAction, CommandFactory, Parser, Subcommand, ValueEnum};
+use colored::Colorize;
+use indicatif::{ProgressBar, ProgressStyle};
+use rand::{seq::SliceRandom, thread_rng};
+use rpassword::read_password;
+use tracing::{info, warn};
+
+use crate::config::{load as load_config, save_default_env};
+use crate::generator::{GeneratedCommand, generate_command};
+
+#[derive(Parser, Debug)]
+#[command(
+    name = "task",
+    author,
+    version,
+    about = "Generate safe shell commands from natural language prompts",
+    long_about = "task is a CLI assistant that converts natural language descriptions into shell commands using OpenAI-backed intelligence.",
+    after_help = "EXAMPLES:\n  task gen \"list large files\" --shell zsh -v\n  echo \"list staged changes\" | task gen --verbose\n\nCONFIG:\n  ~/.task.toml    Default configuration file.\n  --config         Override configuration path.\n\nENVIRONMENT:\n  OPENAI_API_KEY           Required for live command generation\n  TASK_SH_FAKE_RESPONSE    Optional testing override.",
+    propagate_version = true
+)]
+struct Cli {
+    /// Optional config file path
+    #[arg(long, value_name = "PATH")]
+    config: Option<String>,
+
+    #[command(subcommand)]
+    command: Commands,
+}
+
+#[derive(Subcommand, Debug)]
+enum Commands {
+    /// Generate a shell command from a description
+    Gen {
+        /// Natural language description of the desired task
+        description: Option<String>,
+
+        /// Target shell flavor for the generated command
+        #[arg(long)]
+        shell: Option<Shell>,
+
+        /// Include verbose explanation of the suggested command
+        #[arg(short, long, action = ArgAction::SetTrue)]
+        verbose: bool,
+
+        /// Override the system prompt sent to the model
+        #[arg(long, value_name = "PROMPT")]
+        system_prompt: Option<String>,
+
+        /// Override the model name used for generation
+        #[arg(long, value_name = "MODEL")]
+        model: Option<String>,
+
+        /// Disable progress spinner even if enabled in config
+        #[arg(long, action = ArgAction::SetFalse)]
+        spinner: Option<bool>,
+    },
+
+    /// Generate shell autocompletion scripts
+    Completions {
+        /// Shell to generate completions for
+        #[arg(value_enum)]
+        shell: Shell,
+    },
+}
+
+#[derive(Copy, Clone, Debug, ValueEnum)]
+enum Shell {
+    Bash,
+    Zsh,
+}
+
+impl Shell {
+    fn as_str(&self) -> &'static str {
+        match self {
+            Shell::Bash => "bash",
+            Shell::Zsh => "zsh",
+        }
+    }
+}
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    dotenvy::dotenv().ok();
+    init_tracing();
+    ensure_required_env()?;
+
+    let cli = Cli::parse();
+
+    let config_path = cli.config.as_ref().map(|p| p.into());
+    let app_config = load_config(config_path)?;
+
+    let result = match cli.command {
+        Commands::Gen {
+            description,
+            shell,
+            verbose,
+            system_prompt,
+            model,
+            spinner,
+        } => {
+            let effective_verbose = verbose || app_config.verbose.unwrap_or(false);
+            handle_generate(
+                description,
+                shell.or_else(|| {
+                    app_config
+                        .default_shell
+                        .as_deref()
+                        .and_then(Shell::from_str_case_insensitive)
+                }),
+                effective_verbose,
+                system_prompt.or(app_config.system_prompt.clone()),
+                model.or(app_config.model.clone()),
+                spinner.unwrap_or_else(|| app_config.spinner.unwrap_or(true)),
+            )
+            .await
+        }
+        Commands::Completions { shell } => {
+            generate_completions(shell);
+            Ok(())
+        }
+    };
+
+    match result {
+        Ok(()) => Ok(()),
+        Err(err) => {
+            eprintln!("{}", format!("Error: {:#}", err).red());
+            Err(err)
+        }
+    }
+}
+
+async fn handle_generate(
+    description: Option<String>,
+    shell: Option<Shell>,
+    verbose: bool,
+    system_prompt: Option<String>,
+    model: Option<String>,
+    spinner_enabled: bool,
+) -> Result<()> {
+    let prompt = match description {
+        Some(desc) if !desc.trim().is_empty() => desc,
+        Some(_) | None => {
+            let stdin_value = read_stdin()?;
+            match stdin_value {
+                Some(value) => {
+                    info!("Read description from stdin");
+                    value
+                }
+                None => {
+                    warn!("No description provided via argument or stdin");
+                    String::new()
+                }
+            }
+        }
+    };
+
+    let shell = shell.unwrap_or(Shell::Bash);
+
+    let spinner = if spinner_enabled {
+        let pb = ProgressBar::new_spinner();
+        pb.set_style(
+            ProgressStyle::with_template("{spinner} {msg}")
+                .unwrap()
+                .tick_strings(&["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]),
+        );
+        pb.set_message("Generating command...");
+        pb.enable_steady_tick(Duration::from_millis(120));
+        Some(pb)
+    } else {
+        None
+    };
+
+    let GeneratedCommand {
+        cmd,
+        explanation,
+        raw_response,
+    } = generate_command(
+        prompt.trim(),
+        shell.as_str(),
+        system_prompt.as_deref(),
+        model.as_deref(),
+    )
+    .await
+    .with_context(|| format!("Failed to generate command for description: {prompt}"))?;
+
+    if let Some(pb) = spinner {
+        pb.finish_and_clear();
+    }
+
+    println!(
+        "{}",
+        format!("Suggested command ({}):", shell.as_str()).green()
+    );
+    let is_guidance_only = cmd.trim_start().starts_with('#');
+    let cmd_output = if is_guidance_only {
+        cmd.yellow()
+    } else {
+        cmd.bold().green()
+    };
+    println!("{}", cmd_output);
+
+    if verbose {
+        if let Some(raw) = raw_response {
+            println!("\n{}", "Raw response:".yellow());
+            println!("{}", raw.yellow());
+        }
+
+        println!("\n{}", "Explanation:".green());
+        println!("{}", explanation.green());
+    }
+
+    if !is_guidance_only {
+        maybe_execute(&cmd, shell.as_str())?;
+    }
+
+    Ok(())
+}
+
+fn read_stdin() -> Result<Option<String>> {
+    if atty::is(atty::Stream::Stdin) {
+        return Ok(None);
+    }
+
+    let mut buffer = String::new();
+    io::stdin()
+        .read_to_string(&mut buffer)
+        .context("Failed to read from stdin")?;
+
+    if buffer.trim().is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(buffer))
+    }
+}
+
+fn init_tracing() {
+    let subscriber = tracing_subscriber::FmtSubscriber::builder()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .with_target(false)
+        .finish();
+
+    let _ = tracing::subscriber::set_global_default(subscriber);
+}
+
+fn ensure_required_env() -> Result<()> {
+    const VAR: &str = "OPENAI_API_KEY";
+    if matches!(std::env::var(VAR), Ok(ref v) if !v.trim().is_empty()) {
+        return Ok(());
+    }
+
+    println!(
+        "{}",
+        "task.sh hasn’t been connected to OpenAI yet. Let’s add your API key.".cyan()
+    );
+    println!(
+        "{}",
+        "You can generate one at https://platform.openai.com/api-keys".bright_black()
+    );
+    let key = prompt_for_api_key()?;
+    if key.trim().is_empty() {
+        println!(
+            "{}",
+            "No key entered. Please rerun once you have a key.".red()
+        );
+        std::process::exit(1);
+    }
+
+    save_default_env(VAR, key.trim())?;
+    unsafe {
+        std::env::set_var(VAR, key);
+    }
+    println!("{}", "API key saved to .env".green());
+    Ok(())
+}
+
+fn prompt_for_api_key() -> Result<String> {
+    print!("{}", "API key: ".bright_blue());
+    io::stdout().flush().ok();
+    let key = read_password().context("Failed to read API key")?;
+    Ok(key)
+}
+
+fn maybe_execute(command: &str, shell: &str) -> Result<()> {
+    if command.trim().is_empty() {
+        return Ok(());
+    }
+
+    if !atty::is(atty::Stream::Stdin) {
+        println!(
+            "{}",
+            "Non-interactive session detected; skipping execution.".yellow()
+        );
+        return Ok(());
+    }
+
+    println!(
+        "\n{}",
+        "The following command will be executed:".bright_blue()
+    );
+    println!("{}", format!("{} -c \"{}\"", shell, command).bold());
+
+    println!("{}", "Proceed with execution? [y/N] ".bright_blue());
+    io::stdout().flush().context("Failed to flush stdout")?;
+
+    let mut answer = String::new();
+    io::stdin()
+        .read_line(&mut answer)
+        .context("Failed to read confirmation input")?;
+
+    if matches!(answer.trim().to_lowercase().as_str(), "y" | "yes") {
+        let is_running = Arc::new(AtomicBool::new(true));
+        let animation_handle = spawn_execution_animation(command.to_string(), is_running.clone());
+
+        let status = Command::new(shell)
+            .arg("-c")
+            .arg(command)
+            .status()
+            .context("Failed to spawn shell for execution")?;
+
+        is_running.store(false, Ordering::SeqCst);
+        if let Some(handle) = animation_handle {
+            let _ = handle.join();
+        }
+
+        if status.success() {
+            println!("{}", "Command completed successfully.".green());
+        } else {
+            println!(
+                "{}",
+                format!("Command exited with status: {}", status).red()
+            );
+        }
+    } else {
+        println!("{}", "Command not executed.".yellow());
+    }
+
+    Ok(())
+}
+
+fn spawn_execution_animation(
+    command: String,
+    is_running: Arc<AtomicBool>,
+) -> Option<thread::JoinHandle<()>> {
+    if !atty::is(atty::Stream::Stdout) {
+        println!("{}", format!("Running: {}", command).cyan());
+        return None;
+    }
+
+    Some(thread::spawn(move || {
+        static QUIPS: &[&str] = &[
+            "Asking the kernel nicely, again...",
+            "Sacrificing a goat to the CI gods...",
+            "Turning it off and on again...",
+            "Did you mean to run rm -rf? No? Good.",
+            "Reading the manual so you don't have to...",
+            "Checking if coffee supply is adequate...",
+            "Dropping packets like it's 1999...",
+            "Politely bullying prod into behaving...",
+            "Threatening the CI with a stern email...",
+            "Bribing the load balancer with donuts...",
+            "Performing ritual log sacrifice...",
+            "Convincing cron this isn't personal...",
+            "Telling Kubernetes it's not the chosen one...",
+            "Convincing the firewall to chill...",
+        ];
+
+        static SPINNER: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+
+        let mut rng = thread_rng();
+        let mut quip = QUIPS
+            .choose(&mut rng)
+            .copied()
+            .unwrap_or("Executing command...");
+        let mut spin_idx: usize = 0;
+        let mut pulse_pos: f32 = -6.0;
+        let mut last_quip_update = Instant::now();
+
+        while is_running.load(Ordering::SeqCst) {
+            let frame = SPINNER[spin_idx % SPINNER.len()];
+            let rendered = format!("{} {}", frame, quip);
+            let colored = render_gradient(&rendered, pulse_pos);
+            print!("\r\x1b[2K{}", colored);
+            let _ = io::stdout().flush();
+            spin_idx = spin_idx.wrapping_add(1);
+            thread::sleep(Duration::from_millis(35));
+
+            pulse_pos += 0.85;
+            let span = rendered.chars().count() as f32 + 6.0;
+            if pulse_pos > span {
+                pulse_pos = -6.0;
+            }
+
+            if last_quip_update.elapsed() > Duration::from_secs(6) {
+                quip = QUIPS.choose(&mut rng).copied().unwrap_or(quip);
+                last_quip_update = Instant::now();
+            }
+        }
+
+        print!("\r\x1b[2K");
+        let _ = io::stdout().flush();
+    }))
+}
+
+fn render_gradient(text: &str, pulse_pos: f32) -> String {
+    if text.is_empty() {
+        return String::new();
+    }
+
+    let sigma = 3.5_f32;
+    let base = 150_f32;
+    let amplitude = 100_f32;
+    let mut out = String::with_capacity(text.len());
+    for (idx, ch) in text.chars().enumerate() {
+        let dist = idx as f32 - pulse_pos;
+        let mut intensity = base + amplitude * (-(dist * dist) / (2.0 * sigma * sigma)).exp();
+        intensity = intensity.min(255.0).max(base);
+        let intensity = intensity as u8;
+        out.push_str(
+            &ch.to_string()
+                .truecolor(intensity, intensity, intensity)
+                .to_string(),
+        );
+    }
+    out
+}
+
+fn generate_completions(shell: Shell) {
+    use clap_complete::{generate, shells};
+    use std::io;
+
+    let mut cmd = Cli::command();
+    match shell {
+        Shell::Bash => generate(shells::Bash, &mut cmd, "task", &mut io::stdout()),
+        Shell::Zsh => generate(shells::Zsh, &mut cmd, "task", &mut io::stdout()),
+    }
+}
+
+impl Shell {
+    fn from_str_case_insensitive(value: &str) -> Option<Self> {
+        match value.to_lowercase().as_str() {
+            "bash" => Some(Shell::Bash),
+            "zsh" => Some(Shell::Zsh),
+            _ => None,
+        }
+    }
+}

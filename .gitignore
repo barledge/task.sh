@@ -1,0 +1,25 @@
+# Build outputs
+/target/
+/debug/
+/release/
+
+# Coverage and profiling artifacts
+*.profraw
+*.profdata
+*.gcno
+*.gcda
+
+# Editor and IDE settings
+.vscode/
+.idea/
+
+# OS metadata
+.DS_Store
+
+# Environment files
+.env
+.env.*
+
+# Rust tooling backups
+*.rs.bk
+
