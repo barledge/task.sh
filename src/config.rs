@@ -40,22 +40,6 @@ pub struct FileConfig {
     pub spinner: Option<bool>,
 }
 
-impl FileConfig {
-    fn merge(self, override_path: Option<PathBuf>) -> Result<Self> {
-        if let Some(path) = override_path {
-            if path.exists() {
-                let contents = fs::read_to_string(&path)
-                    .with_context(|| format!("Failed to read config file at {}", path.display()))?;
-                let file_cfg: FileConfig = toml::from_str(&contents).with_context(|| {
-                    format!("Failed to parse config file at {}", path.display())
-                })?;
-                return Ok(file_cfg);
-            }
-        }
-        Ok(self)
-    }
-}
-
 #[derive(Debug, Default, Clone)]
 pub struct AppConfig {
     pub default_shell: Option<String>,
@@ -111,10 +95,6 @@ impl AppConfig {
         if self.spinner.is_none() {
             self.spinner = file.spinner;
         }
-    }
-
-    pub fn default_path() -> Option<PathBuf> {
-        default_path()
     }
 }
 
