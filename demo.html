@@ -1,0 +1,52 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <title>task.sh Demo</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <style>
+        body { font-family: system-ui, sans-serif; margin: 2rem; }
+        textarea { width: 100%; height: 120px; }
+        button { padding: 0.6rem 1.2rem; margin-top: 0.5rem; }
+        pre { background: #111; color: #0f0; padding: 1rem; border-radius: 8px; }
+    </style>
+</head>
+<body>
+    <h1>task.sh Playground</h1>
+    <p>Enter a natural language description to simulate what <code>task.sh</code> would suggest.</p>
+
+    <label for="prompt">Description</label>
+    <textarea id="prompt" placeholder="e.g. list large files"></textarea>
+
+    <label for="shell">Shell</label>
+    <select id="shell">
+        <option value="bash">bash</option>
+        <option value="zsh">zsh</option>
+    </select>
+
+    <button onclick="simulate()">Generate</button>
+
+    <h2>Output</h2>
+    <pre id="output">Waiting...</pre>
+
+    <script>
+        async function simulate() {
+            const prompt = document.getElementById('prompt').value.trim();
+            const shell = document.getElementById('shell').value;
+            const output = document.getElementById('output');
+
+            if (!prompt) {
+                output.textContent = 'Provide a prompt to continue.';
+                return;
+            }
+
+            output.textContent = 'Simulating response...';
+
+            // Placeholder simulation. In production, wire this to a serverless handler that
+            // invokes the Rust binary and streams back results.
+            await new Promise(resolve => setTimeout(resolve, 600));
+            output.textContent = `Shell: ${shell}\nCommand: echo 'TODO: ${prompt}'\nExplanation: Replace with live OpenAI call.`;
+        }
+    </script>
+</body>
+</html>
