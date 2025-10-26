@@ -10,7 +10,8 @@ use std::sync::{
 use std::thread;
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow};
+use atty::Stream;
 use clap::{ArgAction, CommandFactory, Parser, Subcommand, ValueEnum};
 use colored::Colorize;
 use indicatif::{ProgressBar, ProgressStyle};
@@ -95,9 +96,12 @@ impl Shell {
 async fn main() -> Result<()> {
     dotenvy::dotenv().ok();
     init_tracing();
-    ensure_required_env()?;
 
     let cli = Cli::parse();
+
+    if needs_api_key(&cli) {
+        ensure_required_env()?;
+    }
 
     let config_path = cli.config.as_ref().map(|p| p.into());
     let app_config = load_config(config_path)?;
@@ -255,10 +259,33 @@ fn init_tracing() {
     let _ = tracing::subscriber::set_global_default(subscriber);
 }
 
+fn needs_api_key(cli: &Cli) -> bool {
+    matches!(cli.command, Commands::Gen { .. })
+}
+
 fn ensure_required_env() -> Result<()> {
     const VAR: &str = "OPENAI_API_KEY";
+    const FAKE_VAR: &str = "TASK_SH_FAKE_RESPONSE";
+
     if matches!(std::env::var(VAR), Ok(ref v) if !v.trim().is_empty()) {
         return Ok(());
+    }
+
+    if let Ok(_fake) = std::env::var(FAKE_VAR) {
+        unsafe {
+            std::env::set_var(VAR, "sk-test-placeholder");
+        }
+        println!(
+            "{}",
+            format!("Using {} for deterministic output.", FAKE_VAR).bright_black()
+        );
+        return Ok(());
+    }
+
+    if !atty::is(Stream::Stdin) {
+        return Err(anyhow!(
+            "OPENAI_API_KEY is not set. Provide it via environment, .env, or use TASK_SH_FAKE_RESPONSE for testing."
+        ));
     }
 
     println!(
@@ -269,8 +296,10 @@ fn ensure_required_env() -> Result<()> {
         "{}",
         "You can generate one at https://platform.openai.com/api-keys".bright_black()
     );
+
     let key = prompt_for_api_key()?;
-    if key.trim().is_empty() {
+    let trimmed = key.trim();
+    if trimmed.is_empty() {
         println!(
             "{}",
             "No key entered. Please rerun once you have a key.".red()
@@ -278,9 +307,9 @@ fn ensure_required_env() -> Result<()> {
         std::process::exit(1);
     }
 
-    save_default_env(VAR, key.trim())?;
+    save_default_env(VAR, trimmed)?;
     unsafe {
-        std::env::set_var(VAR, key);
+        std::env::set_var(VAR, trimmed);
     }
     println!("{}", "API key saved to .env".green());
     Ok(())
