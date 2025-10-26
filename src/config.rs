@@ -53,29 +53,28 @@ pub fn load(user_path: Option<PathBuf>) -> Result<AppConfig> {
     let mut cfg = AppConfig::default();
 
     if let Some(path) = user_path.clone() {
-        if path.exists() {
-            let contents = fs::read_to_string(&path)
-                .with_context(|| format!("Failed to read config file at {}", path.display()))?;
-            let file_cfg: FileConfig = toml::from_str(&contents)
-                .with_context(|| format!("Failed to parse config file at {}", path.display()))?;
-            cfg.apply(file_cfg);
+        load_from_path(&mut cfg, &path)?;
+        if cfg.is_populated() {
             return Ok(cfg);
         }
     }
 
     if let Some(default_path) = default_path() {
-        if default_path.exists() {
-            let contents = fs::read_to_string(&default_path).with_context(|| {
-                format!("Failed to read config file at {}", default_path.display())
-            })?;
-            let file_cfg: FileConfig = toml::from_str(&contents).with_context(|| {
-                format!("Failed to parse config file at {}", default_path.display())
-            })?;
-            cfg.apply(file_cfg);
-        }
+        load_from_path(&mut cfg, &default_path)?;
     }
 
     Ok(cfg)
+}
+
+fn load_from_path(cfg: &mut AppConfig, path: &PathBuf) -> Result<()> {
+    if path.exists() {
+        let contents = fs::read_to_string(path)
+            .with_context(|| format!("Failed to read config file at {}", path.display()))?;
+        let file_cfg: FileConfig = toml::from_str(&contents)
+            .with_context(|| format!("Failed to parse config file at {}", path.display()))?;
+        cfg.apply(file_cfg);
+    }
+    Ok(())
 }
 
 impl AppConfig {
@@ -95,6 +94,14 @@ impl AppConfig {
         if self.spinner.is_none() {
             self.spinner = file.spinner;
         }
+    }
+
+    fn is_populated(&self) -> bool {
+        self.default_shell.is_some()
+            || self.model.is_some()
+            || self.system_prompt.is_some()
+            || self.verbose.is_some()
+            || self.spinner.is_some()
     }
 }
 

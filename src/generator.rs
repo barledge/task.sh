@@ -148,11 +148,14 @@ pub async fn generate_command(
 
                 if content.trim().is_empty() {
                     if let Some(tool_calls) = choice.message.tool_calls {
-                        content = tool_calls
+                        let fallback = tool_calls
                             .into_iter()
-                            .map(|call| call.function.arguments.clone())
+                            .map(|call| call.function.arguments)
                             .collect::<Vec<_>>()
                             .join("\n");
+                        if !fallback.trim().is_empty() {
+                            content = fallback;
+                        }
                     }
                 }
 
@@ -265,27 +268,11 @@ fn parse_completion_content(raw: &str) -> Result<(String, String)> {
         }
 
         let lower = trimmed.to_lowercase();
-        if lower.starts_with("command:") {
-            let value = trimmed
-                .splitn(2, ':')
-                .nth(1)
-                .map(str::trim)
-                .unwrap_or("")
-                .to_string();
-            if !value.is_empty() {
-                command = Some(value);
-            }
-        } else if lower.starts_with("explanation:") {
-            let value = trimmed
-                .splitn(2, ':')
-                .nth(1)
-                .map(str::trim)
-                .unwrap_or("")
-                .to_string();
-            if !value.is_empty() {
-                explanation = Some(value);
-            }
+        if let Some(value) = extract_after_prefix(&lower, trimmed, "command:") {
+            command = Some(value);
+        } else if let Some(value) = extract_after_prefix(&lower, trimmed, "explanation:") {
             explanation_line = Some(trimmed.to_string());
+            explanation = Some(value);
         } else {
             body_lines.push(trimmed.to_string());
         }
@@ -314,6 +301,17 @@ fn parse_completion_content(raw: &str) -> Result<(String, String)> {
     let explanation = explanation.unwrap_or_else(|| "No explanation provided.".to_string());
 
     Ok((cmd, explanation))
+}
+
+fn extract_after_prefix(lower: &str, original: &str, prefix: &str) -> Option<String> {
+    if lower.starts_with(prefix) {
+        original
+            .split_once(':')
+            .map(|(_, tail)| tail.trim().to_string())
+            .filter(|value| !value.is_empty())
+    } else {
+        None
+    }
 }
 
 /// Run heuristic safety checks against the generated command.
