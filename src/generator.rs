@@ -146,16 +146,15 @@ pub async fn generate_command(
 
                 let mut content = choice.message.content.unwrap_or_default();
 
-                if content.trim().is_empty() {
-                    if let Some(tool_calls) = choice.message.tool_calls {
-                        let fallback = tool_calls
-                            .into_iter()
-                            .map(|call| call.function.arguments)
-                            .collect::<Vec<_>>()
-                            .join("\n");
-                        if !fallback.trim().is_empty() {
-                            content = fallback;
-                        }
+                let needs_fallback = content.trim().is_empty();
+                if let Some(tool_calls) = choice.message.tool_calls.filter(|_| needs_fallback) {
+                    let fallback = tool_calls
+                        .into_iter()
+                        .map(|call| call.function.arguments)
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    if !fallback.trim().is_empty() {
+                        content = fallback;
                     }
                 }
 
