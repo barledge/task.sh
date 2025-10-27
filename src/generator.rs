@@ -301,14 +301,12 @@ fn parse_completion_content(raw: &str) -> Result<ParsedResponse> {
             collecting_command_list = false;
         } else if trimmed.eq_ignore_ascii_case("commands:") {
             collecting_command_list = true;
-        } else {
-            if collecting_command_list {
-                if let Some(candidate) = parse_list_command(trimmed) {
-                    alternatives.push(candidate);
-                }
-            } else {
-                body_lines.push(trimmed.to_string());
+        } else if collecting_command_list {
+            if let Some(candidate) = parse_list_command(trimmed) {
+                alternatives.push(candidate);
             }
+        } else {
+            body_lines.push(trimmed.to_string());
         }
     }
 
@@ -488,13 +486,13 @@ fn parse_list_command(line: &str) -> Option<String> {
     static NUMBERED: Lazy<Regex> =
         Lazy::new(|| Regex::new(r"^(\d+)[\).]\s+(?P<cmd>.+)$").expect("valid regex"));
 
-    if let Some(caps) = NUMBERED.captures(trimmed) {
-        if let Some(cmd) = caps.name("cmd") {
-            let candidate = cmd.as_str().trim();
-            if looks_like_command(candidate) {
-                return Some(candidate.to_string());
-            }
-        }
+    if let Some(candidate) = NUMBERED
+        .captures(trimmed)
+        .and_then(|caps| caps.name("cmd"))
+        .map(|cmd| cmd.as_str().trim().to_string())
+        .filter(|candidate| looks_like_command(candidate))
+    {
+        return Some(candidate);
     }
 
     None
@@ -510,7 +508,7 @@ fn looks_like_command(value: &str) -> bool {
         return false;
     }
 
-    if trimmed.split_whitespace().next().map_or(true, |head| {
+    if trimmed.split_whitespace().next().is_none_or(|head| {
         matches!(
             head,
             "the" | "this" | "that" | "those" | "uses" | "use" | "command"
@@ -526,7 +524,7 @@ fn extract_inline_code(input: &str) -> Option<String> {
     let mut chars = input.char_indices();
     let mut start: Option<usize> = None;
 
-    while let Some((idx, ch)) = chars.next() {
+    for (idx, ch) in &mut chars {
         if ch == '`' {
             if let Some(begin) = start.take() {
                 if begin < idx {
