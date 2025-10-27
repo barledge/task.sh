@@ -235,17 +235,15 @@ async fn handle_generate(
     let mut seen_commands: HashSet<String> = HashSet::new();
     let mut command_options: Vec<String> = Vec::new();
 
-    if let Some(primary_cmd) = executable_command(&cmd) {
-        if seen_commands.insert(primary_cmd.clone()) {
-            command_options.push(primary_cmd);
-        }
+    if let Some(primary_cmd) =
+        executable_command(&cmd).filter(|pc| seen_commands.insert(pc.clone()))
+    {
+        command_options.push(primary_cmd);
     }
 
-    alternatives
-        .iter()
-        .filter_map(|alt| executable_command(alt))
-        .filter(|cmd_option| seen_commands.insert(cmd_option.clone()))
-        .for_each(|cmd_option| command_options.push(cmd_option));
+    command_options.extend(alternatives.iter().filter_map(|alt| {
+        executable_command(alt).filter(|cmd_option| seen_commands.insert(cmd_option.clone()))
+    }));
 
     if command_options.is_empty() {
         if is_guidance_only {
