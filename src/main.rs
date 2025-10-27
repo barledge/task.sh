@@ -236,18 +236,16 @@ async fn handle_generate(
     let mut command_options: Vec<String> = Vec::new();
 
     if let Some(primary_cmd) = executable_command(&cmd) {
-        if matches!(seen_commands.insert(primary_cmd.clone()), true) {
+        if seen_commands.insert(primary_cmd.clone()) {
             command_options.push(primary_cmd);
         }
     }
 
-    for alt in &alternatives {
-        if let Some(cmd_option) = executable_command(alt) {
-            if matches!(seen_commands.insert(cmd_option.clone()), true) {
-                command_options.push(cmd_option);
-            }
-        }
-    }
+    alternatives
+        .iter()
+        .filter_map(|alt| executable_command(alt))
+        .filter(|cmd_option| seen_commands.insert(cmd_option.clone()))
+        .for_each(|cmd_option| command_options.push(cmd_option));
 
     if command_options.is_empty() {
         if is_guidance_only {
