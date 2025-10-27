@@ -2763,6 +2763,7 @@ dependencies = [
  "assert_cmd",
  "async-openai",
  "atty",
+ "chrono",
  "clap",
  "clap_complete",
  "colored",

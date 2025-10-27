@@ -1,4 +1,9 @@
-use std::{env, sync::Arc, time::Duration};
+use std::{
+    collections::HashSet,
+    env,
+    sync::Arc,
+    time::Duration,
+};
 
 use anyhow::{Context, Result, anyhow};
 use async_openai::{
@@ -16,6 +21,12 @@ use regex::Regex;
 use tokio::time::sleep;
 use tracing::{debug, trace, warn};
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CommandConfidence {
+    Certain,
+    NeedsConfirmation,
+}
+
 /// A generated shell command returned by the AI backend.
 ///
 /// This struct bundles the executable command, a short explanation, and an optional raw response
@@ -24,12 +35,14 @@ use tracing::{debug, trace, warn};
 /// # Examples
 ///
 /// ```
-/// use task_sh::generator::GeneratedCommand;
+/// use task_sh::generator::{GeneratedCommand, CommandConfidence};
 ///
 /// let command = GeneratedCommand {
 ///     cmd: "echo 'hello'".into(),
 ///     explanation: "Prints hello".into(),
 ///     raw_response: None,
+///     confidence: CommandConfidence::Certain,
+///     alternatives: vec![],
 /// };
 /// assert!(command.cmd.contains("echo"));
 /// ```
@@ -38,10 +51,13 @@ pub struct GeneratedCommand {
     pub cmd: String,
     pub explanation: String,
     pub raw_response: Option<String>,
+    pub confidence: CommandConfidence,
+    pub alternatives: Vec<String>,
 }
 
 /// Fake response override environment variable.
 const FAKE_RESPONSE_ENV: &str = "TASK_SH_FAKE_RESPONSE";
+const DISABLE_MACHINE_CONTEXT_ENV: &str = "TASK_SH_DISABLE_MACHINE_CONTEXT";
 
 /// OpenAI chat model used for generation.
 pub const MODEL: &str = "gpt-3.5-turbo";
@@ -80,6 +96,8 @@ pub async fn generate_command(
             cmd: "# Please provide more details.".to_string(),
             explanation: "Description was empty or ambiguous.".to_string(),
             raw_response: None,
+            confidence: CommandConfidence::Certain,
+            alternatives: vec![],
         });
     }
 
@@ -89,18 +107,22 @@ pub async fn generate_command(
             cmd: "# Please provide more details.".to_string(),
             explanation: "Description appears too short or ambiguous.".to_string(),
             raw_response: None,
+            confidence: CommandConfidence::Certain,
+            alternatives: vec![],
         });
     }
 
     if let Ok(fake) = env::var(FAKE_RESPONSE_ENV) {
         trace!("Using fake response for testing mode");
-        let (cmd, explanation) = parse_completion_content(&fake)?;
-        enforce_safety(&cmd)?;
+        let parsed = parse_completion_content(&fake)?;
+        enforce_safety(&parsed.command)?;
 
         return Ok(GeneratedCommand {
-            cmd,
-            explanation,
+            cmd: parsed.command,
+            explanation: parsed.explanation,
             raw_response: Some(fake),
+            confidence: parsed.confidence,
+            alternatives: parsed.alternatives,
         });
     }
 
@@ -112,11 +134,15 @@ pub async fn generate_command(
         return Err(anyhow!("OPENAI_API_KEY is empty"));
     }
 
-    let system_prompt = custom_system_prompt.map(|prompt| prompt.to_string()).unwrap_or_else(|| {
-        format!(
-            "Generate a safe {shell} command for: {desc}. Explain briefly. Avoid destructive actions like rm -rf or sudo."
-        )
-    });
+    let system_prompt = custom_system_prompt
+        .map(|prompt| prompt.to_string())
+        .unwrap_or_else(|| {
+            format!(
+                "You are an expert {shell} assistant.\nTask: {desc}\nRequirements:\n1. When confident, reply using:\n   Command: <single {shell} command>\n   Explanation: <short justification>\n2. When unsure or multiple safe approaches exist, reply using:\n   Commands:\n   - <command option 1>\n   - <command option 2>\n   Explanation: <how to choose / warnings>\n3. Never fabricate output (avoid echoing statements unless the user explicitly wants a literal message).\n4. Prefer real inspection commands (e.g., hostname, uname -a, sysctl, system_profiler) for environment questions.\n5. Guidance-only responses must start with '#'."
+            )
+        });
+
+    let system_prompt = append_machine_context(&system_prompt);
 
     let user_prompt = format!("Description: {desc}");
 
@@ -160,15 +186,17 @@ pub async fn generate_command(
 
                 trace!(%content, "raw completion content");
 
-                let (cmd, explanation) = parse_completion_content(&content)?;
-                enforce_safety(&cmd)?;
+                let parsed = parse_completion_content(&content)?;
+                enforce_safety(&parsed.command)?;
 
-                debug!(command = %cmd, "Generated command candidate");
+                debug!(command = %parsed.command, "Generated command candidate");
 
                 return Ok(GeneratedCommand {
-                    cmd,
-                    explanation,
+                    cmd: parsed.command,
+                    explanation: parsed.explanation,
                     raw_response: Some(content),
+                    confidence: parsed.confidence,
+                    alternatives: parsed.alternatives,
                 });
             }
             Ok(Err(err)) => {
@@ -232,13 +260,15 @@ fn build_chat_request(
 }
 
 /// Parse the command and explanation from the raw OpenAI response content.
-fn parse_completion_content(raw: &str) -> Result<(String, String)> {
+fn parse_completion_content(raw: &str) -> Result<ParsedResponse> {
     let mut command: Option<String> = None;
     let mut explanation: Option<String> = None;
     let mut explanation_line: Option<String> = None;
     let mut body_lines: Vec<String> = Vec::new();
     let mut code_buffer: Vec<String> = Vec::new();
     let mut in_code_block = false;
+    let mut collecting_command_list = false;
+    let mut alternatives: Vec<String> = Vec::new();
 
     for raw_line in raw.lines() {
         let trimmed = raw_line.trim();
@@ -263,6 +293,7 @@ fn parse_completion_content(raw: &str) -> Result<(String, String)> {
         }
 
         if trimmed.is_empty() {
+            collecting_command_list = false;
             continue;
         }
 
@@ -272,8 +303,17 @@ fn parse_completion_content(raw: &str) -> Result<(String, String)> {
         } else if let Some(value) = extract_after_prefix(&lower, trimmed, "explanation:") {
             explanation_line = Some(trimmed.to_string());
             explanation = Some(value);
+            collecting_command_list = false;
+        } else if trimmed.eq_ignore_ascii_case("commands:") {
+            collecting_command_list = true;
         } else {
-            body_lines.push(trimmed.to_string());
+            if collecting_command_list {
+                if let Some(candidate) = parse_list_command(trimmed) {
+                    alternatives.push(candidate);
+                }
+            } else {
+                body_lines.push(trimmed.to_string());
+            }
         }
     }
 
@@ -297,9 +337,34 @@ fn parse_completion_content(raw: &str) -> Result<(String, String)> {
     }
 
     let cmd = command.context("OpenAI response missing 'Command:' line")?;
+    let (cmd, confidence) = coerce_command(&cmd, raw, &alternatives);
     let explanation = explanation.unwrap_or_else(|| "No explanation provided.".to_string());
 
-    Ok((cmd, explanation))
+    let mut seen = HashSet::new();
+    let mut alt_vec: Vec<String> = Vec::new();
+
+    for alt in alternatives {
+        if !alt.eq_ignore_ascii_case(&cmd)
+            && seen.insert(alt.to_ascii_lowercase())
+            && looks_like_command(&alt)
+        {
+            alt_vec.push(alt);
+        }
+    }
+
+    Ok(ParsedResponse {
+        command: cmd,
+        explanation,
+        alternatives: alt_vec,
+        confidence,
+    })
+}
+
+struct ParsedResponse {
+    command: String,
+    explanation: String,
+    alternatives: Vec<String>,
+    confidence: CommandConfidence,
 }
 
 fn extract_after_prefix(lower: &str, original: &str, prefix: &str) -> Option<String> {
@@ -353,6 +418,159 @@ fn compute_backoff_delay(err: &OpenAIError, attempt: usize) -> Duration {
     Duration::from_millis(base_delay_ms * (attempt as u64 + 1))
 }
 
+fn append_machine_context(prompt: &str) -> String {
+    if env::var_os(DISABLE_MACHINE_CONTEXT_ENV).is_some() {
+        return prompt.to_string();
+    }
+
+    let os = std::env::consts::OS;
+    let arch = std::env::consts::ARCH;
+    let shell = env::var("SHELL").unwrap_or_else(|_| "unknown".to_string());
+
+    format!(
+        "{prompt}\n\nHost context: os={os}, arch={arch}, shell={shell}."
+    )
+}
+
+fn coerce_command(candidate: &str, raw: &str, _alternatives: &[String]) -> (String, CommandConfidence) {
+    let trimmed = candidate.trim();
+    if trimmed.is_empty() {
+        return (String::new(), CommandConfidence::NeedsConfirmation);
+    }
+
+    if trimmed.starts_with('#') {
+        return (trimmed.to_string(), CommandConfidence::Certain);
+    }
+
+    if let Some(inline) = extract_inline_code(trimmed) {
+        return (inline, CommandConfidence::Certain);
+    }
+
+    if looks_like_sentence(trimmed) {
+        if let Some(inline) = extract_inline_code(raw) {
+            return (inline, CommandConfidence::Certain);
+        }
+        return (
+            format!("# {}", trimmed),
+            CommandConfidence::NeedsConfirmation,
+        );
+    }
+
+    let looks_incomplete = INCOMPLETE_PATTERNS
+        .iter()
+        .any(|pattern| pattern.is_match(trimmed));
+
+    if looks_incomplete {
+        return (
+            trimmed.to_string(),
+            CommandConfidence::NeedsConfirmation,
+        );
+    }
+
+    (
+        trimmed.to_string(),
+        CommandConfidence::Certain,
+    )
+}
+
+static INCOMPLETE_PATTERNS: Lazy<Vec<Regex>> = Lazy::new(|| {
+    vec![
+        Regex::new(r"(?i)\b(the|this|that|those|it)\b").expect("valid regex"),
+        Regex::new(r"(?i)\b(use\s+the\b)").expect("valid regex"),
+        Regex::new(r"(?i)\bcommand\b").expect("valid regex"),
+    ]
+});
+
+fn parse_list_command(line: &str) -> Option<String> {
+    let trimmed = line.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    if let Some(candidate) = trimmed.strip_prefix("- ") {
+        let candidate = candidate.trim();
+        if looks_like_command(candidate) {
+            return Some(candidate.to_string());
+        }
+    }
+
+    static NUMBERED: Lazy<Regex> = Lazy::new(|| {
+        Regex::new(r"^(\d+)[\).]\s+(?P<cmd>.+)$").expect("valid regex")
+    });
+
+    if let Some(caps) = NUMBERED.captures(trimmed) {
+        if let Some(cmd) = caps.name("cmd") {
+            let candidate = cmd.as_str().trim();
+            if looks_like_command(candidate) {
+                return Some(candidate.to_string());
+            }
+        }
+    }
+
+    None
+}
+
+fn looks_like_command(value: &str) -> bool {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+
+    if trimmed.starts_with('#') {
+        return false;
+    }
+
+    if trimmed.split_whitespace().next().map_or(true, |head| {
+        matches!(head, "the" | "this" | "that" | "those" | "uses" | "use" | "command")
+    }) {
+        return false;
+    }
+
+    true
+}
+
+fn extract_inline_code(input: &str) -> Option<String> {
+    let mut chars = input.char_indices();
+    let mut start: Option<usize> = None;
+
+    while let Some((idx, ch)) = chars.next() {
+        if ch == '`' {
+            if let Some(begin) = start.take() {
+                if begin < idx {
+                    let snippet = &input[begin..idx];
+                    let trimmed = snippet.trim();
+                    if !trimmed.is_empty() {
+                        return Some(trimmed.to_string());
+                    }
+                }
+            } else {
+                start = Some(idx + 1);
+            }
+        }
+    }
+
+    None
+}
+
+fn looks_like_sentence(value: &str) -> bool {
+    if value.contains('\n') {
+        return false;
+    }
+
+    let trimmed = value.trim();
+    let first_word = trimmed.split_whitespace().next().unwrap_or("");
+    if first_word.is_empty() {
+        return false;
+    }
+
+    let lowered = first_word.to_lowercase();
+    if matches!(lowered.as_str(), "the" | "this" | "that" | "these" | "those" | "it") {
+        return true;
+    }
+
+    trimmed.ends_with('.')
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -367,10 +585,15 @@ mod tests {
     #[test]
     fn parses_command_and_explanation() {
         let raw = "Command: echo hello\nExplanation: Prints a greeting";
-        let (cmd, explanation) = parse_completion_content(raw).expect("should parse");
+        let parsed = parse_completion_content(raw).expect("should parse");
 
-        assert_eq!(cmd, "echo hello");
-        assert_eq!(explanation, "Prints a greeting");
+        assert_eq!(parsed.command, "echo hello");
+        assert_eq!(parsed.explanation, "Prints a greeting");
+        assert!(parsed
+            .alternatives
+            .iter()
+            .all(|alt| !alt.to_lowercase().contains("command")));
+        assert_eq!(parsed.confidence, CommandConfidence::Certain);
     }
 
     #[test]
@@ -381,10 +604,12 @@ mod tests {
 
     #[test]
     fn missing_command_line_errors() {
-        let (cmd, explanation) =
+        let parsed =
             parse_completion_content("Explanation: hi").expect("fallback should handle");
-        assert_eq!(cmd, "Explanation: hi");
-        assert_eq!(explanation, "hi");
+        assert_eq!(parsed.command, "Explanation: hi");
+        assert_eq!(parsed.explanation, "hi");
+        assert!(parsed.alternatives.is_empty());
+        assert_eq!(parsed.confidence, CommandConfidence::Certain);
     }
 
     #[tokio::test]
@@ -395,6 +620,8 @@ mod tests {
 
         assert!(result.cmd.contains("Please provide more details"));
         assert!(result.raw_response.is_none());
+        assert_eq!(result.confidence, CommandConfidence::Certain);
+        assert!(result.alternatives.is_empty());
     }
 
     #[tokio::test]
@@ -412,6 +639,11 @@ mod tests {
         assert_eq!(result.cmd, "ls");
         assert_eq!(result.explanation, "List files");
         assert!(result.raw_response.is_some());
+        assert_eq!(result.confidence, CommandConfidence::Certain);
+        assert!(result
+            .alternatives
+            .iter()
+            .all(|alt| !alt.to_lowercase().contains("command")));
 
         unset_fake_response();
     }
@@ -424,11 +656,11 @@ mod tests {
             env::set_var(FAKE_RESPONSE_ENV, "Command: rm -rf /\nExplanation: wipe");
         }
 
-        let err = generate_command("delete everything", "bash", None, None)
+        let result = generate_command("delete everything", "bash", None, None)
             .await
             .expect_err("should block unsafe command");
 
-        assert!(err.to_string().contains("blocked"));
+        assert!(result.to_string().contains("blocked"));
 
         unset_fake_response();
     }
@@ -440,5 +672,6 @@ mod tests {
             .expect("ambiguous prompts return guidance");
 
         assert!(result.cmd.starts_with('#'));
+        assert_eq!(result.confidence, CommandConfidence::Certain);
     }
 }

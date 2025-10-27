@@ -1,8 +1,11 @@
 mod config;
 mod generator;
 
+use std::collections::HashSet;
+use std::fs;
 use std::io::{self, Read, Write};
-use std::process::Command;
+use std::path::Path;
+use std::process::{Command, Stdio};
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
@@ -18,9 +21,10 @@ use indicatif::{ProgressBar, ProgressStyle};
 use rand::{seq::SliceRandom, thread_rng};
 use rpassword::read_password;
 use tracing::{info, warn};
+use chrono::{DateTime, Local};
 
 use crate::config::{load as load_config, save_default_env};
-use crate::generator::{GeneratedCommand, generate_command};
+use crate::generator::{CommandConfidence, GeneratedCommand, generate_command};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -191,6 +195,8 @@ async fn handle_generate(
         cmd,
         explanation,
         raw_response,
+        confidence,
+        alternatives,
     } = generate_command(
         prompt.trim(),
         shell.as_str(),
@@ -226,8 +232,60 @@ async fn handle_generate(
         println!("{}", explanation.green());
     }
 
-    if !is_guidance_only {
-        maybe_execute(&cmd, shell.as_str())?;
+    let mut seen_commands: HashSet<String> = HashSet::new();
+    let mut command_options: Vec<String> = Vec::new();
+
+    if let Some(primary_cmd) = executable_command(&cmd) {
+        if seen_commands.insert(primary_cmd.clone()) {
+            command_options.push(primary_cmd);
+        }
+    }
+
+    for alt in &alternatives {
+        if let Some(cmd_option) = executable_command(alt) {
+            if seen_commands.insert(cmd_option.clone()) {
+                command_options.push(cmd_option);
+            }
+        }
+    }
+
+    if command_options.is_empty() {
+        if is_guidance_only {
+            println!(
+                "{}",
+                "The assistant provided guidance only; no command will be executed.".yellow()
+            );
+        }
+        println!(
+            "{}",
+            "No runnable commands were produced. The request may be unclear—try adding more detail.".yellow()
+        );
+        return Ok(());
+    }
+
+    if command_options.len() > 1 {
+        println!("\n{}", "Command options:".yellow());
+        for (idx, option) in command_options.iter().enumerate() {
+            println!("  {}. {}", idx + 1, option);
+        }
+        println!(
+            "{}",
+            "Multiple possible commands detected. Choose one to run:".bright_yellow()
+        );
+        if let Some(choice) = prompt_for_command_selection(&command_options)? {
+            confirm_and_execute(&choice, shell.as_str())?;
+        } else {
+            println!("{}", "No command selected; exiting.".yellow());
+        }
+    } else {
+        let primary_cmd = &command_options[0];
+        if matches!(confidence, CommandConfidence::NeedsConfirmation) {
+            println!(
+                "{}",
+                "AI is unsure about this command; review carefully before running.".bright_yellow()
+            );
+        }
+        confirm_and_execute(primary_cmd, shell.as_str())?;
     }
 
     Ok(())
@@ -322,7 +380,7 @@ fn prompt_for_api_key() -> Result<String> {
     Ok(key)
 }
 
-fn maybe_execute(command: &str, shell: &str) -> Result<()> {
+fn maybe_execute(command: &str, shell: &str, _force_interactive: bool) -> Result<()> {
     if command.trim().is_empty() {
         return Ok(());
     }
@@ -335,45 +393,46 @@ fn maybe_execute(command: &str, shell: &str) -> Result<()> {
         return Ok(());
     }
 
-    println!(
-        "\n{}",
-        "The following command will be executed:".bright_blue()
-    );
-    println!("{}", format!("{} -c \"{}\"", shell, command).bold());
+    let is_running = Arc::new(AtomicBool::new(true));
+    let animation_handle = spawn_execution_animation(command.to_string(), is_running.clone());
 
-    println!("{}", "Proceed with execution? [y/N] ".bright_blue());
-    io::stdout().flush().context("Failed to flush stdout")?;
+    let output = Command::new(shell)
+        .arg("-c")
+        .arg(command)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .context("Failed to execute command")?;
 
-    let mut answer = String::new();
-    io::stdin()
-        .read_line(&mut answer)
-        .context("Failed to read confirmation input")?;
+    is_running.store(false, Ordering::SeqCst);
+    if let Some(handle) = animation_handle {
+        let _ = handle.join();
+    }
 
-    if matches!(answer.trim().to_lowercase().as_str(), "y" | "yes") {
-        let is_running = Arc::new(AtomicBool::new(true));
-        let animation_handle = spawn_execution_animation(command.to_string(), is_running.clone());
+    println!();
 
-        let status = Command::new(shell)
-            .arg("-c")
-            .arg(command)
-            .status()
-            .context("Failed to spawn shell for execution")?;
-
-        is_running.store(false, Ordering::SeqCst);
-        if let Some(handle) = animation_handle {
-            let _ = handle.join();
+    if !output.stdout.is_empty() {
+        let resolved = enrich_find_output(command, &output.stdout)?;
+        io::stdout().write_all(resolved.as_bytes())?;
+        if !resolved.ends_with('\n') {
+            println!();
         }
+    }
 
-        if status.success() {
-            println!("{}", "Command completed successfully.".green());
-        } else {
-            println!(
-                "{}",
-                format!("Command exited with status: {}", status).red()
-            );
+    if !output.stderr.is_empty() {
+        io::stderr().write_all(&output.stderr)?;
+        if !output.stderr.ends_with(b"\n") {
+            eprintln!();
         }
+    }
+
+    if output.status.success() {
+        println!("{}", "Command completed successfully.".green());
     } else {
-        println!("{}", "Command not executed.".yellow());
+        println!(
+            "{}",
+            format!("Command exited with status: {}", output.status).red()
+        );
     }
 
     Ok(())
@@ -383,7 +442,7 @@ fn spawn_execution_animation(
     command: String,
     is_running: Arc<AtomicBool>,
 ) -> Option<thread::JoinHandle<()>> {
-    if !atty::is(atty::Stream::Stdout) {
+    if !atty::is(atty::Stream::Stderr) {
         println!("{}", format!("Running: {}", command).cyan());
         return None;
     }
@@ -421,8 +480,9 @@ fn spawn_execution_animation(
             let frame = SPINNER[spin_idx % SPINNER.len()];
             let rendered = format!("{} {}", frame, quip);
             let colored = render_gradient(&rendered, pulse_pos);
-            print!("\r\x1b[2K{}", colored);
-            let _ = io::stdout().flush();
+            let mut stderr = io::stderr();
+            let _ = write!(stderr, "\r\x1b[2K{}", colored);
+            let _ = stderr.flush();
             spin_idx = spin_idx.wrapping_add(1);
             thread::sleep(Duration::from_millis(35));
 
@@ -438,8 +498,9 @@ fn spawn_execution_animation(
             }
         }
 
-        print!("\r\x1b[2K");
-        let _ = io::stdout().flush();
+        let mut stderr = io::stderr();
+        let _ = write!(stderr, "\r\x1b[2K");
+        let _ = stderr.flush();
     }))
 }
 
@@ -485,4 +546,122 @@ impl Shell {
             _ => None,
         }
     }
+}
+
+fn enrich_find_output(command: &str, stdout: &[u8]) -> Result<String> {
+    if !command.trim_start().starts_with("find") {
+        return Ok(String::from_utf8_lossy(stdout).into_owned());
+    }
+
+    let output_str = String::from_utf8_lossy(stdout);
+    let mut enriched = String::new();
+
+    for line in output_str.lines() {
+        let path = line.trim();
+        if path.is_empty() {
+            continue;
+        }
+
+        let metadata = match fs::metadata(Path::new(path)) {
+            Ok(meta) => meta,
+            Err(_) => {
+                enriched.push_str(path);
+                enriched.push('\n');
+                continue;
+            }
+        };
+
+        let size = metadata.len();
+        let modified = metadata.modified().ok().map(|time| {
+            DateTime::<Local>::from(time).format("%Y-%m-%d %H:%M:%S").to_string()
+        });
+        let display_size = format_size(size);
+        let mut entry = format!("{}  {}", display_size, path);
+        if let Some(ts) = modified {
+            entry.push_str(&format!("  (modified {})", ts));
+        }
+        enriched.push_str(&entry);
+        enriched.push('\n');
+    }
+
+    Ok(enriched)
+}
+
+fn format_size(bytes: u64) -> String {
+    let mut bytes = bytes;
+    let mut unit = "B";
+    if bytes >= 1_000_000_000 {
+        bytes /= 1_000_000_000;
+        unit = "GB";
+    } else if bytes >= 1_000_000 {
+        bytes /= 1_000_000;
+        unit = "MB";
+    } else if bytes >= 1_000 {
+        bytes /= 1_000;
+        unit = "KB";
+    }
+    format!("{} {}", bytes, unit)
+}
+
+fn prompt_for_command_selection(commands: &[String]) -> Result<Option<String>> {
+    if commands.is_empty() {
+        return Ok(None);
+    }
+
+    loop {
+        println!("{}", "Select a command to run:".cyan());
+        for (idx, command) in commands.iter().enumerate() {
+            println!("  {}) {}", idx + 1, command);
+        }
+        println!("  0) Cancel");
+        print!("Enter choice (default 0): ");
+        io::stdout().flush().context("Failed to flush stdout")?;
+        let mut input = String::new();
+        io::stdin()
+            .read_line(&mut input)
+            .context("Failed to read selection")?;
+        let trimmed = input.trim();
+        if trimmed.is_empty() || trimmed == "0" {
+            return Ok(None);
+        }
+        if let Ok(idx) = trimmed.parse::<usize>() {
+            if (1..=commands.len()).contains(&idx) {
+                return Ok(Some(commands[idx - 1].clone()));
+            }
+        }
+        println!("{}", "Invalid selection, please try again.".yellow());
+    }
+}
+
+fn executable_command(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() || trimmed.starts_with('#') {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+fn confirm_and_execute(command: &str, shell: &str) -> Result<()> {
+    println!(
+        "\n{}",
+        "The following command will be executed:".bright_blue()
+    );
+    println!("{}", format!("{} -c \"{}\"", shell, command).bold());
+
+    println!("{}", "Proceed with execution? [y/N] ".bright_blue());
+    io::stdout().flush().context("Failed to flush stdout")?;
+
+    let mut answer = String::new();
+    io::stdin()
+        .read_line(&mut answer)
+        .context("Failed to read confirmation input")?;
+
+    if matches!(answer.trim().to_lowercase().as_str(), "y" | "yes") {
+        maybe_execute(command, shell, true)?;
+    } else {
+        println!("{}", "Command not executed.".yellow());
+    }
+
+    Ok(())
 }
