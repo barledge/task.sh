@@ -236,14 +236,14 @@ async fn handle_generate(
     let mut command_options: Vec<String> = Vec::new();
 
     if let Some(primary_cmd) = executable_command(&cmd) {
-        if seen_commands.insert(primary_cmd.clone()) {
+        if matches!(seen_commands.insert(primary_cmd.clone()), true) {
             command_options.push(primary_cmd);
         }
     }
 
     for alt in &alternatives {
         if let Some(cmd_option) = executable_command(alt) {
-            if seen_commands.insert(cmd_option.clone()) {
+            if matches!(seen_commands.insert(cmd_option.clone()), true) {
                 command_options.push(cmd_option);
             }
         }
@@ -626,10 +626,12 @@ fn prompt_for_command_selection(commands: &[String]) -> Result<Option<String>> {
         if trimmed.is_empty() || trimmed == "0" {
             return Ok(None);
         }
-        if let Ok(idx) = trimmed.parse::<usize>() {
-            if (1..=commands.len()).contains(&idx) {
-                return Ok(Some(commands[idx - 1].clone()));
-            }
+        if let Some(idx) = trimmed
+            .parse::<usize>()
+            .ok()
+            .filter(|idx| (1..=commands.len()).contains(idx))
+        {
+            return Ok(Some(commands[idx - 1].clone()));
         }
         println!("{}", "Invalid selection, please try again.".yellow());
     }
