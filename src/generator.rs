@@ -1,9 +1,4 @@
-use std::{
-    collections::HashSet,
-    env,
-    sync::Arc,
-    time::Duration,
-};
+use std::{collections::HashSet, env, sync::Arc, time::Duration};
 
 use anyhow::{Context, Result, anyhow};
 use async_openai::{
@@ -427,12 +422,14 @@ fn append_machine_context(prompt: &str) -> String {
     let arch = std::env::consts::ARCH;
     let shell = env::var("SHELL").unwrap_or_else(|_| "unknown".to_string());
 
-    format!(
-        "{prompt}\n\nHost context: os={os}, arch={arch}, shell={shell}."
-    )
+    format!("{prompt}\n\nHost context: os={os}, arch={arch}, shell={shell}.")
 }
 
-fn coerce_command(candidate: &str, raw: &str, _alternatives: &[String]) -> (String, CommandConfidence) {
+fn coerce_command(
+    candidate: &str,
+    raw: &str,
+    _alternatives: &[String],
+) -> (String, CommandConfidence) {
     let trimmed = candidate.trim();
     if trimmed.is_empty() {
         return (String::new(), CommandConfidence::NeedsConfirmation);
@@ -461,16 +458,10 @@ fn coerce_command(candidate: &str, raw: &str, _alternatives: &[String]) -> (Stri
         .any(|pattern| pattern.is_match(trimmed));
 
     if looks_incomplete {
-        return (
-            trimmed.to_string(),
-            CommandConfidence::NeedsConfirmation,
-        );
+        return (trimmed.to_string(), CommandConfidence::NeedsConfirmation);
     }
 
-    (
-        trimmed.to_string(),
-        CommandConfidence::Certain,
-    )
+    (trimmed.to_string(), CommandConfidence::Certain)
 }
 
 static INCOMPLETE_PATTERNS: Lazy<Vec<Regex>> = Lazy::new(|| {
@@ -494,9 +485,8 @@ fn parse_list_command(line: &str) -> Option<String> {
         }
     }
 
-    static NUMBERED: Lazy<Regex> = Lazy::new(|| {
-        Regex::new(r"^(\d+)[\).]\s+(?P<cmd>.+)$").expect("valid regex")
-    });
+    static NUMBERED: Lazy<Regex> =
+        Lazy::new(|| Regex::new(r"^(\d+)[\).]\s+(?P<cmd>.+)$").expect("valid regex"));
 
     if let Some(caps) = NUMBERED.captures(trimmed) {
         if let Some(cmd) = caps.name("cmd") {
@@ -521,7 +511,10 @@ fn looks_like_command(value: &str) -> bool {
     }
 
     if trimmed.split_whitespace().next().map_or(true, |head| {
-        matches!(head, "the" | "this" | "that" | "those" | "uses" | "use" | "command")
+        matches!(
+            head,
+            "the" | "this" | "that" | "those" | "uses" | "use" | "command"
+        )
     }) {
         return false;
     }
@@ -564,7 +557,10 @@ fn looks_like_sentence(value: &str) -> bool {
     }
 
     let lowered = first_word.to_lowercase();
-    if matches!(lowered.as_str(), "the" | "this" | "that" | "these" | "those" | "it") {
+    if matches!(
+        lowered.as_str(),
+        "the" | "this" | "that" | "these" | "those" | "it"
+    ) {
         return true;
     }
 
@@ -589,10 +585,12 @@ mod tests {
 
         assert_eq!(parsed.command, "echo hello");
         assert_eq!(parsed.explanation, "Prints a greeting");
-        assert!(parsed
-            .alternatives
-            .iter()
-            .all(|alt| !alt.to_lowercase().contains("command")));
+        assert!(
+            parsed
+                .alternatives
+                .iter()
+                .all(|alt| !alt.to_lowercase().contains("command"))
+        );
         assert_eq!(parsed.confidence, CommandConfidence::Certain);
     }
 
@@ -604,8 +602,7 @@ mod tests {
 
     #[test]
     fn missing_command_line_errors() {
-        let parsed =
-            parse_completion_content("Explanation: hi").expect("fallback should handle");
+        let parsed = parse_completion_content("Explanation: hi").expect("fallback should handle");
         assert_eq!(parsed.command, "Explanation: hi");
         assert_eq!(parsed.explanation, "hi");
         assert!(parsed.alternatives.is_empty());
@@ -640,10 +637,12 @@ mod tests {
         assert_eq!(result.explanation, "List files");
         assert!(result.raw_response.is_some());
         assert_eq!(result.confidence, CommandConfidence::Certain);
-        assert!(result
-            .alternatives
-            .iter()
-            .all(|alt| !alt.to_lowercase().contains("command")));
+        assert!(
+            result
+                .alternatives
+                .iter()
+                .all(|alt| !alt.to_lowercase().contains("command"))
+        );
 
         unset_fake_response();
     }

@@ -15,13 +15,13 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow};
 use atty::Stream;
+use chrono::{DateTime, Local};
 use clap::{ArgAction, CommandFactory, Parser, Subcommand, ValueEnum};
 use colored::Colorize;
 use indicatif::{ProgressBar, ProgressStyle};
 use rand::{seq::SliceRandom, thread_rng};
 use rpassword::read_password;
 use tracing::{info, warn};
-use chrono::{DateTime, Local};
 
 use crate::config::{load as load_config, save_default_env};
 use crate::generator::{CommandConfidence, GeneratedCommand, generate_command};
@@ -573,7 +573,9 @@ fn enrich_find_output(command: &str, stdout: &[u8]) -> Result<String> {
 
         let size = metadata.len();
         let modified = metadata.modified().ok().map(|time| {
-            DateTime::<Local>::from(time).format("%Y-%m-%d %H:%M:%S").to_string()
+            DateTime::<Local>::from(time)
+                .format("%Y-%m-%d %H:%M:%S")
+                .to_string()
         });
         let display_size = format_size(size);
         let mut entry = format!("{}  {}", display_size, path);
