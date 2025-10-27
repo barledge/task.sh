@@ -240,7 +240,7 @@ async fn handle_generate(
             command_options.push(primary_cmd);
         }
     }
- 
+
     for alt in &alternatives {
         if let Some(cmd_option) = executable_command(alt) {
             if seen_commands.insert(cmd_option.clone()) {
